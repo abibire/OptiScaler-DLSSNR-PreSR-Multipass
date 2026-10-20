@@ -354,6 +354,7 @@ class State
         //{
         _skipOwner = owner;
         _skipChecks = true;
+        _skipThreadId = GetCurrentThreadId();
         _skipDllName[_skipOwner] = dllName;
         //}
     };
@@ -375,6 +376,9 @@ class State
         }
 
         _skipChecks = (_skipOwner != 0);
+
+        if (!_skipChecks)
+            _skipThreadId = 0;
         //}
     };
 
@@ -396,7 +400,13 @@ class State
         }
     };
 
-    static bool SkipDllChecks() { return _skipChecks; }
+    // Only the thread that asked for the skip gets it. Streamline's init can take seconds, and a
+    // process-wide skip let the game's own nvngx.dll load (on another thread) bypass OptiScaler in
+    // that window, so DLSS, Neural Rendering and the FG inputs never reached OptiScaler.
+    static bool SkipDllChecks()
+    {
+        return _skipChecks && (_skipThreadId == 0 || _skipThreadId == GetCurrentThreadId());
+    }
     static std::string SkipDllName()
     {
         return _skipOwner == 0 ? "" : (_skipDllName.contains(_skipOwner) ? _skipDllName[_skipOwner] : "");
@@ -405,6 +415,7 @@ class State
 
   private:
     inline static bool _skipChecks = false;
+    inline static DWORD _skipThreadId = 0;
     inline static std::map<UINT, std::string> _skipDllName;
     inline static UINT _skipOwner = 0;
     inline static UINT _lastOwner = 0;
