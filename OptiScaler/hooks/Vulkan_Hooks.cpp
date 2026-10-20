@@ -319,7 +319,10 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
     memcpy(&localPresentInfo, pPresentInfo, sizeof(VkPresentInfoKHR));
 
     // render menu if needed
-    if (!MenuOverlayVk::QueuePresent(queue, &localPresentInfo))
+    //
+    // Proton: a D3D game's presents arrive here through DXVK/vkd3d-proton. Its menu is drawn on the DXGI side, as on
+    // Windows; drawing it here as well left the GPU waiting forever (Dark Souls II with the DS2 Lighting Engine).
+    if (!IdentifyGpu::getPrimaryGpu().usesDxvk && !MenuOverlayVk::QueuePresent(queue, &localPresentInfo))
     {
         LOG_ERROR("QueuePresent: false!");
         return VK_ERROR_OUT_OF_DATE_KHR;
@@ -405,7 +408,9 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
         _device = device;
         LOG_DEBUG("_device captured: {0:X}", (UINT64) _device);
 
-        MenuOverlayVk::CreateSwapchain(device, _PD, _instance, _hwnd, pCreateInfo, pAllocator, pSwapchain);
+        // Proton: DXVK/vkd3d-proton swapchains belong to a D3D game, whose menu lives on the DXGI side.
+        if (!IdentifyGpu::getPrimaryGpu().usesDxvk)
+            MenuOverlayVk::CreateSwapchain(device, _PD, _instance, _hwnd, pCreateInfo, pAllocator, pSwapchain);
     }
 
     LOG_FUNC_RESULT(result);
