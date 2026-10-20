@@ -56,8 +56,17 @@ inline std::vector<std::string> SupportedDeviceExtensions(PFN_vkGetInstanceProcA
     if (getInstanceProcAddr == nullptr || physicalDevice == VK_NULL_HANDLE)
         return out;
 
-    auto enumerate = (PFN_vkEnumerateDeviceExtensionProperties) getInstanceProcAddr(
-        instance, "vkEnumerateDeviceExtensionProperties");
+    // Proton: the captured VkInstance can already be destroyed, and asking the loader about a dead
+    // instance aborts the process. The vulkan-1.dll export needs no instance, so prefer it.
+    PFN_vkEnumerateDeviceExtensionProperties enumerate = nullptr;
+
+    if (HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll"); vulkanModule != nullptr)
+        enumerate = (PFN_vkEnumerateDeviceExtensionProperties) GetProcAddress(
+            vulkanModule, "vkEnumerateDeviceExtensionProperties");
+
+    if (enumerate == nullptr && instance != VK_NULL_HANDLE)
+        enumerate = (PFN_vkEnumerateDeviceExtensionProperties) getInstanceProcAddr(
+            instance, "vkEnumerateDeviceExtensionProperties");
 
     if (enumerate == nullptr)
         return out;
