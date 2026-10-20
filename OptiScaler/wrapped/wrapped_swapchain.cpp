@@ -328,6 +328,11 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // DXVK check, it's here because of upscaler time calculations
     if (IdentifyGpu::getPrimaryGpu().usesDxvk)
     {
+        // Proton: draw the menu here, on the D3D side, as on Windows. Drawing it on DXVK's own Vulkan present
+        // left the GPU waiting forever, so Vulkan_Hooks.cpp no longer does that for D3D games.
+        if (willPresent)
+            MenuOverlayDx::Present(pSwapChain, SyncInterval, Flags, pPresentParameters, pDevice, hWnd, isUWP);
+
         if (pPresentParameters == nullptr)
             presentResult = pSwapChain->Present(SyncInterval, Flags);
         else
