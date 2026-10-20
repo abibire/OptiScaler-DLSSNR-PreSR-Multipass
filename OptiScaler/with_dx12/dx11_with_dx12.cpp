@@ -395,23 +395,36 @@ bool Dx11WithDx12::CopyTextureFrom11To12(ID3D11Resource* InResource, D3D11_TEXTU
     // Proton/DXVK: a texture the game already shares (for example one opened from its own D3D12 device)
     // keeps the shared flags but hands back no handle, so it can never be opened on our D3D12 device.
     // Treat it as unshared and go through a private shared copy instead, like any other source.
-    if (sourceHasLegacyShared && !sourceHasNTShared)
+    if (sourceHasLegacyShared || sourceHasNTShared)
     {
         IDXGIResource1* probe = nullptr;
         HANDLE probeHandle = NULL;
 
         if (originalTexture->QueryInterface(IID_PPV_ARGS(&probe)) == S_OK && probe != nullptr)
         {
-            if (probe->GetSharedHandle(&probeHandle) != S_OK)
+            if (sourceHasNTShared)
+            {
+                if (probe->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ, NULL, &probeHandle) != S_OK)
+                    probeHandle = NULL;
+
+                // Only a test: the real handle is created again below with the access it needs.
+                if (probeHandle != NULL)
+                    CloseHandle(probeHandle);
+            }
+            else if (probe->GetSharedHandle(&probeHandle) != S_OK)
+            {
                 probeHandle = NULL;
+            }
 
             probe->Release();
         }
 
         if (probeHandle == NULL)
         {
-            LOG_DEBUG("Source texture is shared but has no handle, using a private shared copy");
+            LOG_DEBUG("Source texture is shared but has no handle (NT: {}), using a private shared copy",
+                      sourceHasNTShared);
             sourceHasLegacyShared = false;
+            sourceHasNTShared = false;
         }
     }
 
