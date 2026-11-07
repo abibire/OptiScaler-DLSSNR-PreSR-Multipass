@@ -11,7 +11,7 @@
 #include <imgui/imgui_impl_win32.h>
 
 // menu
-static int const NUM_BACK_BUFFERS = 8;
+static int const NUM_BACK_BUFFERS = DXGI_MAX_SWAP_CHAIN_BUFFERS;
 static int const SRV_HEAP_SIZE = 64;
 static bool _dx11Device = false;
 static bool _dx12Device = false;
@@ -89,13 +89,16 @@ static void CreateRenderTargetDx12(ID3D12Device* device, IDXGISwapChain* pSwapCh
         return;
     }
 
+    if (sd.BufferCount == 0 || sd.BufferCount > NUM_BACK_BUFFERS)
+    {
+        LOG_ERROR("Unsupported menu back buffer count: {}", sd.BufferCount);
+        return;
+    }
+
     for (UINT i = 0; i < sd.BufferCount; ++i)
     {
         ID3D12Resource* pBackBuffer = nullptr;
         auto result = pSwapChain->GetBuffer(i, IID_PPV_ARGS(&pBackBuffer));
-
-        if (pBackBuffer != nullptr)
-            pBackBuffer->Release();
 
         if (result != S_OK)
         {
@@ -122,13 +125,12 @@ static void CleanupRenderTargetDx12(bool clearQueue)
     if (!_isInited || !_dx12Device || State::Instance().isShuttingDown)
         return;
 
-    LOG_TRACE("clearQueue: {}", clearQueue);
-
     for (UINT i = 0; i < NUM_BACK_BUFFERS; ++i)
     {
-        if (g_mainRenderTargetResource[i])
-            g_mainRenderTargetResource[i] = nullptr;
+        SAFE_RELEASE(g_mainRenderTargetResource[i]);
     }
+
+    LOG_TRACE("clearQueue: {}", clearQueue);
 
     if (clearQueue)
     {
@@ -442,6 +444,12 @@ static void RenderImGui_DX12(IDXGISwapChain* pSwapChainPlain)
                 ImGui::Render();
 
                 UINT backBufferIdx = pSwapChain->GetCurrentBackBufferIndex();
+                if (backBufferIdx >= NUM_BACK_BUFFERS || g_mainRenderTargetResource[backBufferIdx] == nullptr ||
+                    g_commandAllocators[backBufferIdx] == nullptr)
+                {
+                    pSwapChain->Release();
+                    return;
+                }
                 ID3D12CommandAllocator* commandAllocator = g_commandAllocators[backBufferIdx];
 
                 auto result = commandAllocator->Reset();
@@ -626,3 +634,5 @@ void MenuOverlayDx::Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     if (device12 != nullptr)
         device12->Release();
 }
+
+void MenuOverlayDx::ApplyThemeStyle() { MenuOverlayBase::ApplyThemeStyle(); }

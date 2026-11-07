@@ -1,6 +1,10 @@
 #include <pch.h>
 
 #include "Streamline_Hooks.h"
+#if defined(OPTISCALER_RTX40_MFG)
+#include <framegen/dlssg/MfgUnlock.h>
+#endif
+#include <dlssnr/DlssNr_StreamlinePicture.h>
 
 #include <Util.h>
 #include <Config.h>
@@ -10,7 +14,6 @@
 #include <hooks/Reflex_Hooks.h>
 #include <menu/menu_overlay_base.h>
 #include <framegen/nvngx/Nvngx_FG.h>
-#include <framegen/dlssg/MfgUnlock.h>
 #include <proxies/KernelBase_Proxy.h>
 #include <imgui/ImGuiNotify.hpp>
 
@@ -74,7 +77,7 @@ char* StreamlineHooks::trimStreamlineLog(const char* msg)
 
 void StreamlineHooks::streamlineLogCallback(sl::LogType type, const char* msg)
 {
-    if (msg == nullptr)
+    if (msg == nullptr || State::Instance().isShuttingDown)
         return;
 
     char* trimmed_msg = trimStreamlineLog(msg);
@@ -571,7 +574,7 @@ sl::Result StreamlineHooks::hkslSetD3DDevice(void* d3dDevice)
 
 void StreamlineHooks::streamlineLogCallback_sl1(sl1::LogType type, const char* msg)
 {
-    if (msg == nullptr)
+    if (msg == nullptr || State::Instance().isShuttingDown)
         return;
 
     char* trimmed_msg = trimStreamlineLog(msg);
@@ -1091,6 +1094,25 @@ bool StreamlineHooks::hkcommon_slOnPluginLoad(sl::param::IParameters* params, co
     return result;
 }
 
+#if defined(OPTISCALER_RTX40_MFG)
+static void RefreshAdaMfgLimit()
+{
+    auto& state = State::Instance();
+    const auto maximum = static_cast<int>(MfgUnlock::UnlockedMax());
+    if (maximum <= state.dlssgMfgMax.value_or(0))
+        return;
+
+    state.dlssgMfgMax = maximum;
+    auto& overrideCount = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+    const auto requested = overrideCount.value_for_config();
+    // A preliminary provider may have clamped this session to one. Recover the
+    // saved request on success; an explicit later UI choice supersedes it.
+    if (overrideCount.has_value() && requested.has_value() &&
+        (requested.value() > overrideCount.value() || overrideCount.value() > maximum))
+        overrideCount.set_volatile_value(std::min(requested.value(), maximum));
+}
+#endif
+
 sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options)
 {
     lastDlssgViewport = viewport;
@@ -1110,6 +1132,11 @@ sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewpo
         newOptions = options;
 
     newOptions.structVersion = newStructVer;
+
+#if defined(OPTISCALER_RTX40_MFG)
+    // What the game asked for, before any override. A struct too old to carry the field reads as 1 (2X).
+    const unsigned int requestedCount = newOptions.numFramesToGenerate;
+#endif
 
     auto& state = State::Instance();
 
@@ -1147,26 +1174,18 @@ sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewpo
 
     if (dlssgPotentiallyActive && state.streamlineVersion >= feature_version { 2, 7, 1 })
     {
-        // Before the read, so the count this captures is the patched one. Five stays under the
-        // sanity bound below.
+#if defined(OPTISCALER_RTX40_MFG)
         MfgUnlock::TryApply();
+        RefreshAdaMfgLimit();
+#endif
 
-        // nvngx_dlssg.dll can load after this runs, and the ceiling read before it does is Ada's
-        // 1. Caching that holds it for the session and clamps the override to it. ModuleFound
-        // means the patches have been attempted, so from there the answer is final either way.
-        const bool unlockPending = MfgUnlock::Pending();
-
-        // Populate dlssgMfgMax once
-        if (!state.dlssgMfgMax.has_value() && !unlockPending)
+        // Respect the native limit while discovery is pending; a later unlock refreshes it.
+        if (!state.dlssgMfgMax.has_value())
         {
             sl::DLSSGState localState {};
             sl::DLSSGOptions localOptions {};
             if (o_slDLSSGGetState(viewport, localState, &localOptions) == sl::Result::eOk)
             {
-                // A wrapper ahead of the snippet can answer a lower ceiling than the patched one.
-                if (auto unlockedMax = MfgUnlock::UnlockedMax(); unlockedMax > localState.numFramesToGenerateMax)
-                    localState.numFramesToGenerateMax = unlockedMax;
-
                 if (localState.numFramesToGenerateMax > 0 && localState.numFramesToGenerateMax < 6)
                 {
                     state.dlssgMfgMax = localState.numFramesToGenerateMax;
@@ -1210,17 +1229,24 @@ sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewpo
 
     state.dlssgLastSetMode = newOptions.mode;
 
-    return o_slDLSSGSetOptions(viewport, newOptions);
+    const auto result = o_slDLSSGSetOptions(viewport, newOptions);
+
+#if defined(OPTISCALER_RTX40_MFG)
+    MfgUnlock::RecordSetOptions(requestedCount, newOptions.numFramesToGenerate, newOptions.mode != sl::DLSSGMode::eOff,
+                                static_cast<unsigned int>(result));
+#endif
+
+    return result;
 }
 
 sl::Result StreamlineHooks::hkslDLSSGGetState(const sl::ViewportHandle& viewport, sl::DLSSGState& state,
                                               const sl::DLSSGOptions* options)
 {
-    // Ahead of every read of numFramesToGenerateMax, which is the value the patch raises.
-    MfgUnlock::TryApply();
-
     sl::Result result {};
 
+#if defined(OPTISCALER_RTX40_MFG)
+    MfgUnlock::TryApply();
+#endif
     const auto originalStructVersion = state.structVersion;
     if (originalStructVersion < 4)
     {
@@ -1240,12 +1266,6 @@ sl::Result StreamlineHooks::hkslDLSSGGetState(const sl::ViewportHandle& viewport
             state.numFramesToGenerateMax = newState.numFramesToGenerateMax;
             state.bReserved4 = newState.bReserved4;
             state.bIsVsyncSupportAvailable = newState.bIsVsyncSupportAvailable;
-
-            // nvngx_dlssg.dll answers the real ceiling, but a Streamline wrapper between here and the
-            // snippet can carry a lower one of its own. Publish the unlocked count. Struct version 1
-            // ends ahead of this field, so the raise stays inside this branch.
-            if (auto unlockedMax = MfgUnlock::UnlockedMax(); unlockedMax > state.numFramesToGenerateMax)
-                state.numFramesToGenerateMax = unlockedMax;
         }
 
         if (originalStructVersion >= 3)
@@ -1256,6 +1276,13 @@ sl::Result StreamlineHooks::hkslDLSSGGetState(const sl::ViewportHandle& viewport
         }
 
         State::Instance().dlssgGameDMFGSupported = newState.bIsDynamicMFGSupported == sl::eTrue;
+
+#if defined(OPTISCALER_RTX40_MFG)
+        // The real DLSS-G's count, unless our own frame generation stands in for it (it writes its own
+        // count further down).
+        if (State::Instance().activeFgInput != FGInput::DLSSG)
+            MfgUnlock::RecordState(newState.numFramesActuallyPresented);
+#endif
     }
     else
     {
@@ -1264,10 +1291,17 @@ sl::Result StreamlineHooks::hkslDLSSGGetState(const sl::ViewportHandle& viewport
             return result;
         State::Instance().dlssgGameDMFGSupported = state.bIsDynamicMFGSupported == sl::eTrue;
 
-        // The wrapper's ceiling, replaced by the unlocked count.
-        if (auto unlockedMax = MfgUnlock::UnlockedMax(); unlockedMax > state.numFramesToGenerateMax)
-            state.numFramesToGenerateMax = unlockedMax;
+#if defined(OPTISCALER_RTX40_MFG)
+        if (State::Instance().activeFgInput != FGInput::DLSSG)
+            MfgUnlock::RecordState(state.numFramesActuallyPresented);
+#endif
     }
+
+#if defined(OPTISCALER_RTX40_MFG)
+    // Version 1 has no maximum-count field: retain its ABI boundary.
+    if (originalStructVersion >= 2)
+        state.numFramesToGenerateMax = std::max(state.numFramesToGenerateMax, MfgUnlock::UnlockedMax());
+#endif
 
     if (!State::Instance().dlssgGameDMFGSupported)
     {
@@ -1275,22 +1309,18 @@ sl::Result StreamlineHooks::hkslDLSSGGetState(const sl::ViewportHandle& viewport
     }
 
     auto& optiState = State::Instance();
+#if defined(OPTISCALER_RTX40_MFG)
+    RefreshAdaMfgLimit();
+#endif
 
     if (optiState.streamlineVersion >= feature_version { 2, 7, 1 })
     {
-        // Provisional until the snippet has been seen. See the note in hkslDLSSGSetOptions.
-        const bool unlockPending = MfgUnlock::Pending();
-
-        if (!optiState.dlssgMfgMax.has_value() && !unlockPending)
+        if (!optiState.dlssgMfgMax.has_value())
         {
             sl::DLSSGState localState {};
             sl::DLSSGOptions localOptions {};
             if (o_slDLSSGGetState(viewport, localState, &localOptions) == sl::Result::eOk)
             {
-                // A wrapper ahead of the snippet can answer a lower ceiling than the patched one.
-                if (auto unlockedMax = MfgUnlock::UnlockedMax(); unlockedMax > localState.numFramesToGenerateMax)
-                    localState.numFramesToGenerateMax = unlockedMax;
-
                 if (localState.numFramesToGenerateMax > 0 && localState.numFramesToGenerateMax < 6)
                 {
                     optiState.dlssgMfgMax = localState.numFramesToGenerateMax;
@@ -1439,6 +1469,8 @@ void* StreamlineHooks::hkdlss_slGetPluginFunction(const char* functionName)
 
 void* StreamlineHooks::hkdlssg_slGetPluginFunction(const char* functionName)
 {
+    if (auto* hook = DlssNr::StreamlinePicture::Wrap(functionName, o_dlssg_slGetPluginFunction))
+        return hook;
     // LOG_DEBUG("{}", functionName);
 
     if (strcmp(functionName, "slOnPluginLoad") == 0)
@@ -1501,6 +1533,8 @@ void* StreamlineHooks::hkdlssg_slGetPluginFunction(const char* functionName)
 
 void* StreamlineHooks::hklocal_dlssg_slGetPluginFunction(const char* functionName)
 {
+    if (auto* hook = DlssNr::StreamlinePicture::Wrap(functionName, o_local_dlssg_slGetPluginFunction, true))
+        return hook;
     // LOG_DEBUG("{}", functionName);
 
     if (strcmp(functionName, "slOnPluginLoad") == 0 && State::Instance().activeFgNvngx != FGNvngxReplacement::None)
@@ -1786,7 +1820,7 @@ void StreamlineHooks::updateDlssgOptions()
 void StreamlineHooks::applyMenuDlssgInterlock(sl::DLSSGOptions& options, bool potentiallyActive)
 {
     auto& state = State::Instance();
-    if (state.externalFrameGeneration || (state.swapchainApi != API::Vulkan && !state.menuOverlayIsVulkan))
+    if (state.swapchainApi != API::Vulkan && !state.menuOverlayIsVulkan)
         return;
     if (potentiallyActive && !MenuOverlayBase::IsVisible())
         state.delayMenuRenderBy = 10;
@@ -1863,8 +1897,6 @@ void StreamlineHooks::unhookInterposer()
 // Call it just after sl.interposer's load or if sl.interposer is already loaded
 void StreamlineHooks::hookInterposer(HMODULE slInterposer)
 {
-    if (State::Instance().externalFrameGeneration)
-        return;
     LOG_FUNC();
 
     if (!slInterposer)
@@ -1891,13 +1923,14 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
         unhookInterposer();
 
     {
-        char dllPath[MAX_PATH];
-        GetModuleFileNameA(slInterposer, dllPath, MAX_PATH);
-
-        LOG_TRACE("slInterposer path: {}", dllPath);
-
-        version_t sl_version;
-        Util::GetFileVersion(string_to_wstring(dllPath), &sl_version);
+        // Keep the Windows path in UTF-16, including non-ASCII and long game paths.
+        wchar_t dllPath[32768] {};
+        const DWORD pathLength = GetModuleFileNameW(slInterposer, dllPath, ARRAYSIZE(dllPath));
+        version_t sl_version {};
+        if (pathLength == 0 || pathLength >= ARRAYSIZE(dllPath) || !Util::GetFileVersion(dllPath, &sl_version))
+            LOG_WARN("Could not read sl.interposer.dll's version");
+        else
+            LOG_TRACE("slInterposer path: {}", wstring_to_string(dllPath));
 
         State::Instance().streamlineVersion.major = sl_version.major;
         State::Instance().streamlineVersion.minor = sl_version.minor;
@@ -2086,8 +2119,6 @@ void StreamlineHooks::unhookDlss()
 
 void StreamlineHooks::hookDlss(HMODULE slDlss)
 {
-    if (State::Instance().externalFrameGeneration)
-        return;
     LOG_FUNC();
 
     if (!slDlss)
@@ -2141,8 +2172,6 @@ void StreamlineHooks::unhookDlssg()
 
 void StreamlineHooks::hookDlssg(HMODULE slDlssg)
 {
-    if (State::Instance().externalFrameGeneration)
-        return;
     LOG_FUNC();
 
     if (!slDlssg)
@@ -2150,6 +2179,11 @@ void StreamlineHooks::hookDlssg(HMODULE slDlssg)
         LOG_WARN("Dlssg module in NULL");
         return;
     }
+
+#if defined(OPTISCALER_RTX40_MFG)
+    // The game's copy or the driver's OTA one; both come through here.
+    MfgUnlock::OnStreamlinePluginLoaded(slDlssg);
+#endif
 
     if (o_dlssg_slGetPluginFunction)
         unhookDlssg();
@@ -2194,8 +2228,6 @@ void StreamlineHooks::unhookLocalDlssg()
 
 void StreamlineHooks::hookLocalDlssg(HMODULE slDlssg)
 {
-    if (State::Instance().externalFrameGeneration)
-        return;
     LOG_FUNC();
 
     if (!slDlssg)
@@ -2247,8 +2279,6 @@ void StreamlineHooks::unhookReflex()
 
 void StreamlineHooks::hookReflex(HMODULE slReflex)
 {
-    if (State::Instance().externalFrameGeneration)
-        return;
     LOG_FUNC();
 
     if (!slReflex)
@@ -2305,8 +2335,6 @@ void StreamlineHooks::unhookPcl()
 
 void StreamlineHooks::hookPcl(HMODULE slPcl)
 {
-    if (State::Instance().externalFrameGeneration)
-        return;
     LOG_FUNC();
 
     if (!slPcl)
@@ -2365,8 +2393,6 @@ void StreamlineHooks::unhookCommon()
 
 void StreamlineHooks::hookCommon(HMODULE slCommon)
 {
-    if (State::Instance().externalFrameGeneration)
-        return;
     LOG_FUNC();
 
     if (!slCommon)

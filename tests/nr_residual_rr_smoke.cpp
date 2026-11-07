@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <vector>
 #include <cstddef>
+#include <limits>
 #include "../OptiScaler/shaders/dlssnr/DlssNr_Common.h"
 #include "../OptiScaler/shaders/dlssnr/DlssNr_ResidualPair.h"
 #include "../OptiScaler/shaders/dlssnr/precompile/dlssnr_residual_Shader.h"
@@ -128,6 +129,26 @@ try
     result = run(c, base, model, history, motion);
     expect(closeFloat(result[0].r, 1.25f) && closeFloat(result[0].g, 1) && closeFloat(result[0].b, 2.5f),
            "Accumulation wrong");
+    // The restored host path composes at INPUT resolution, then lets the existing private
+    // upscaler enlarge its encoded difference. No extra strength or spatial enlargement here.
+    const auto accumulated = result;
+    c.ResidualConfidenceSensitivity = 0.1f;
+    const auto responsive = run(c, base, model, history, motion);
+    expect(closeFloat(responsive[0].r, 2) && closeFloat(responsive[0].g, -2), "Confidence gate retained stale history");
+    c.ResidualConfidenceSensitivity = 0;
+    DlssNrConstants compose {};
+    compose.Mode = DlssNrResidualMode_Apply;
+    compose.Width = 2; compose.Height = 1; compose.TransferStrength = 1;
+    result = run(compose, base, accumulated, history, motion);
+    expect(closeFloat(result[0].r, 11.25f) && closeFloat(result[0].g, 11) &&
+           closeFloat(result[0].b, 12.5f) && result[0].a == base[0].a,
+           "Accumulated edit was not preserved for private DLSS encoding");
+    c.ResidualHistoryValid = 0;
+    c.ResidualBlend = .08f;
+    result = run(c, base, model, accumulated, motion);
+    expect(closeFloat(result[0].r, .16f) && closeFloat(result[0].g, -.16f),
+           "Reset did not discard previous residual history at the release default blend");
+    c.ResidualHistoryValid = 1;
     c.ResidualBlend = 0;
     c.ResidualMotionBaseX = 1;
     history = { { 1, 1, 1, 1 }, { 3, 3, 3, 1 } };
@@ -147,7 +168,39 @@ try
     result = run(c, base, model, history, motion);
     for (unsigned i = 0; i < 4; ++i)
         expect(result[i].r == base[i].r && result[i].a == base[i].a, "Zero strength changed output");
-    std::puts("PASS: residual seam identity, cold/warm history, MV subrect, signed upscale, alpha and zero strength");
+    c={}; c.Width=c.GuideWidth=3; c.Height=c.GuideHeight=1;
+    c.HistoryRejection=1; c.ResidualBlend=.25f; c.ResidualScale=c.PreExposure=1;
+    c.MvScaleX=c.MvScaleY=1;
+    base=std::vector<Pixel>(3,{1,1,1,.4f});
+    model={{1,1,1,1},{2,2,2,1},{3,3,3,1}};
+    history=std::vector<Pixel>(3,{.5f,.5f,.5f,0});
+    motion=std::vector<Pixel>(3,{0,0,0,0});
+    result=run(c,base,model,history,motion);
+    expect(closeFloat(result[1].r,1),"Enhanced cold/reset history did not use the current edit");
+    c.ResidualHistoryValid=1;
+    result=run(c,base,model,history,motion);
+    expect(closeFloat(result[1].r,.625f) && closeFloat(result[1].a,0),"Stable enhanced history was discarded");
+    for (auto& p : history) p.a=-1; // same edit, but the underlying surface used to be darker
+    result=run(c,base,model,history,motion);
+    expect(closeFloat(result[1].r,1),"Changed input light retained stale history");
+    history=std::vector<Pixel>(3,{4,4,4,0});
+    result=run(c,base,model,history,motion);
+    expect(closeFloat(result[1].r,1.75f),"History escaped the current edit neighbourhood");
+    history=std::vector<Pixel>(3,{.5f,.5f,.5f,0});
+    motion[1].r=2;
+    result=run(c,base,model,history,motion);
+    expect(closeFloat(result[1].r,1),"Off-screen history left a stale edit");
+    motion[1].r=0;
+    history[1].r=std::numeric_limits<float>::quiet_NaN();
+    result=run(c,base,model,history,motion);
+    expect(closeFloat(result[1].r,1),"Invalid history was not rejected");
+    history=std::vector<Pixel>(3,{.5f,.5f,.5f,0});
+    for (auto& p : base) p.r=p.g=p.b=2;
+    model={{2,2,2,1},{4,4,4,1},{6,6,6,1}};
+    c.ResidualScale=c.PreExposure=2;
+    result=run(c,base,model,history,motion);
+    expect(closeFloat(result[1].r,1.25f) && closeFloat(result[1].a,0),"Pre-exposure change corrupted history");
+    std::puts("PASS: residual seams, history rejection/clipping, exposure changes, motion, composition and alpha");
     return 0;
 }
 catch (const std::exception& e)

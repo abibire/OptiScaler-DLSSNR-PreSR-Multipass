@@ -1,21 +1,7 @@
-// ResidualAcrossRR v2 -- the MV-reprojected temporal accumulator for the pre-SR NR residual.
-//
-// Deliberately a SEPARATE shader from dlssnr.hlsl. Regenerating dlssnr.hlsl's blob with a current
-// dxc produces materially different DXIL from the committed one (older compiler), and that shader
-// carries every NR path -- post-SR, pre-SR, RR, DeferredDLSS, ResidualFG. These two experimental
-// modes get their own tiny blob and a second compute PSO instead, so the battle-tested one is
-// never touched. The cbuffer and bindings mirror dlssnr.hlsl exactly so DlssNr_Dx12's existing
-// root signature and descriptor table are reused as-is; only gResidualBlend is appended, and it
-// fits inside DlssNrConstants' existing 256-byte alignment with no size change.
-//
-//   gMode == 0  Accumulate: (edited - original) blended into the MV-reprojected history layer.
-//               history_t = lerp( reproject(history_{t-1}), edited - original, blend )
-//               The per-frame ray-trace noise term of (edited - original) is temporally
-//               uncorrelated and averages to zero; the enhancement term follows geometry and
-//               persists. Invalid reprojection (off-screen / bad MV) -> the
-//               history is treated as zero at that pixel and rebuilds over the next frames.
-//   gMode == 1  Apply: base + delta * gTransferStrength, clamped non-negative. Run after RR+SR
-//               with the upscaled history layer as the delta.
+// MV-reprojected temporal accumulation of the pre-SR NR residual.
+// Mode 0 blends (edited - original) into history; invalid reprojection fades in from zero.
+// Mode 1 applies the signed residual after upscaling.
+// Bindings match the main NR shader; appended history fields fit its existing constant-buffer allocation.
 
 #ifdef VK_MODE
 [[vk::binding(0, 0)]]
@@ -45,8 +31,8 @@ cbuffer Params : register(b0)
     float gDebugScale;
     uint  gReversibleMode;
     uint  gApplyModel;
-    uint  gUseGameExposure;
-    float gExposurePreMul;
+    uint  gReserved;
+    float gResidualScale;
     uint  gSkinProtection;
     uint  gShowSkinMask;
     float gSkinDetail;
@@ -57,6 +43,13 @@ cbuffer Params : register(b0)
     uint gResidualHistoryValid;
     uint gResidualMotionBaseX;
     uint gResidualMotionBaseY;
+    float gReplaceDetailUnused, gModelWorkScaleUnused, gResidualConfidenceSensitivity;
+    uint gExposureModeUnused;
+    float gHistoryExposureRatio, gExposureTrimUnused, gExposureProtectionUnused;
+    uint gExposureAnchorCountUnused, gExposureSourceWidthUnused, gExposureSourceHeightUnused, gExposurePaddingUnused;
+    float4 gExposureAnchorsUnused[4];
+    float gHaloUnused, gHaloBrightUnused, gHaloRadiusUnused;
+    uint gHistoryRejection;
 };
 
 // Same registers and the same SPIR-V binding numbers as dlssnr.hlsl, including the slots these
@@ -101,6 +94,13 @@ float3 SanitizeFinite3(float3 v, float3 fallback)
                   SanitizeFinite(v.z, fallback.z));
 }
 
+float InputLight(int2 pixel)
+{
+    float3 colour = max(SanitizeFinite3(gSource.Load(int3(pixel, 0)).rgb, 0), 0);
+    float exposure = isfinite(gResidualScale) && gResidualScale > 1e-6 ? gResidualScale : 1.0;
+    return log2(max(dot(colour, float3(0.2126, 0.7152, 0.0722)) / exposure, 1.0 / 1024.0));
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
@@ -122,14 +122,42 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         bool valid = gResidualHistoryValid != 0 && all(isfinite(motion)) && all(abs(motion) < 2.0) &&
                      all(prevUV >= 0.0) && all(prevUV <= 1.0);
 
-        float3 history = valid ? gOriginal.SampleLevel(gLinear, prevUV, 0).rgb : float3(0.0, 0.0, 0.0);
+        float4 old = valid ? gOriginal.SampleLevel(gLinear, prevUV, 0) : float4(0, 0, 0, 0);
+        float3 history = old.rgb;
         history = SanitizeFinite3(history, float3(0.0, 0.0, 0.0));
 
         // Invalid reprojection: history is 0, so the pixel fades in from no edit at the normal blend
         // rate over the next frames. A cold start/cut also fades in, without sampling uninitialized history.
         float a = clamp(gResidualBlend, 0.0, 1.0);
+        float inputLight = 1.0;
+        if (gHistoryRejection != 0)
+        {
+            // Adapted from Lecram's look_compose: clip the edit to today's
+            // neighbours and reject history whose underlying input changed.
+            inputLight = InputLight(int2(id.xy));
+            float loI = inputLight, hiI = inputLight;
+            float3 lo = delta, hi = delta;
+            [unroll] for (int y = -1; y <= 1; ++y) [unroll] for (int x = -1; x <= 1; ++x)
+            {
+                int2 q = clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(gWidth - 1, gHeight - 1));
+                float3 edit = SanitizeFinite3(gModel.Load(int3(q, 0)).rgb - gSource.Load(int3(q, 0)).rgb, delta);
+                lo = min(lo, edit); hi = max(hi, edit);
+                float light = InputLight(q);
+                loI = min(loI, light); hiI = max(hiI, light);
+            }
+            valid = valid && all(isfinite(old));
+            // Match the history to this frame's pre-exposed colour units before clipping.
+            valid = valid && isfinite(gHistoryExposureRatio) && gHistoryExposureRatio > 0;
+            history *= valid ? gHistoryExposureRatio : 1.0;
+            float changed = valid ? max(max(loI - old.a, old.a - hiI), 0.0) : 1.0;
+            a = max(a, smoothstep(0.1, 0.3, changed));
+            history = valid ? clamp(history, lo, hi) : delta;
+        }
+        if (gResidualConfidenceSensitivity > 0.0)
+            a = lerp(a, 1.0, saturate(length(delta - history) / gResidualConfidenceSensitivity));
 
-        gTarget[id.xy] = float4(lerp(history, delta, a), 1.0);
+        // Alpha is unused by composition. Carry input light there without another image.
+        gTarget[id.xy] = float4(lerp(history, delta, a), inputLight);
         return;
     }
 
