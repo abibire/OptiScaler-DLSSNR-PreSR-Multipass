@@ -18,6 +18,7 @@
 #include <vulkan/vulkan.hpp>
 
 #include <dlssnr/DlssNr_VkExtensions.h>
+#include <dlssnr/DlssNrFinished_Vk.h>
 
 #include <detours/detours.h>
 #include <misc/IdentifyGpu.h>
@@ -313,10 +314,17 @@ static VkResult hkvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPres
 
     // Tick feature to let it know if it's frozen
     if (auto currentFeature = State::Instance().currentFeature; currentFeature != nullptr)
-        currentFeature->TickFrozenCheck();
+    {
+        if (auto currentFg = State::Instance().currentFG; currentFg != nullptr)
+            currentFeature->TickFrozenCheck(currentFg->GetInterpolatedFrameCount());
+        else
+            currentFeature->TickFrozenCheck();
+    }
 
     VkPresentInfoKHR localPresentInfo {};
     memcpy(&localPresentInfo, pPresentInfo, sizeof(VkPresentInfoKHR));
+
+    DlssNr::FinishedVkPresent(queue, &localPresentInfo);
 
     // render menu if needed
     //
@@ -348,6 +356,20 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
 {
     LOG_FUNC();
 
+    VkSwapchainCreateInfoKHR nrCreateInfo = *pCreateInfo;
+    // Proton: a DXVK/vkd3d-proton swapchain belongs to a D3D game, whose NR runs on the D3D side.
+    // Querying the surface here deadlocks under Wine when the game recreates the swapchain from
+    // SetFullscreenState/ResizeBuffers (the surface query waits on the busy window thread).
+    const bool prepareNr =
+        Config::Instance()->DlssNrEnabled.value_or_default() && !IdentifyGpu::getPrimaryGpu().usesDxvk;
+    if (prepareNr)
+    {
+        VkSurfaceCapabilitiesKHR capabilities {};
+        if (_PD && vkGetPhysicalDeviceSurfaceCapabilitiesKHR(_PD, pCreateInfo->surface, &capabilities) == VK_SUCCESS)
+            nrCreateInfo.imageUsage |=
+                capabilities.supportedUsageFlags & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        pCreateInfo = &nrCreateInfo;
+    }
     ScopedVulkanCreatingSC scopedVulkanCreatingSC {};
     VkResult result = VK_SUCCESS;
     {
@@ -358,6 +380,8 @@ static VkResult hkvkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateI
     if (result == VK_SUCCESS && device != VK_NULL_HANDLE && pCreateInfo != nullptr && *pSwapchain != VK_NULL_HANDLE &&
         !State::Instance().vulkanSkipHooks)
     {
+        if (prepareNr)
+            DlssNr::FinishedVkSwapchain(device, *pSwapchain, *pCreateInfo);
         State::Instance().screenWidth = static_cast<float>(pCreateInfo->imageExtent.width);
         State::Instance().screenHeight = static_cast<float>(pCreateInfo->imageExtent.height);
 
